@@ -15,6 +15,8 @@ from main import (
     should_skip_file,
     format_env_value,
     insert_python_import_os,
+    try_decode_base64_secret,
+    scan_multiline_block,
 )
 
 
@@ -132,6 +134,33 @@ class TestGitSentinelEdgeCases(unittest.TestCase):
         self.assertAlmostEqual(low, 0.0)
         high = calculate_shannon_entropy("c2VjcmV0X3Rva2VuXzEyMzQ1Njc4OTA=")
         self.assertGreater(high, 3.5)
+
+    def test_multiline_split_secret_detected(self):
+        """
+        Tests that scan_multiline_block reassembles adjacent added lines and finds
+        an OpenAI key that spans two concatenated string fragments.
+        """
+        block_lines = [
+            (10, "API_KEY = 'sk-proj-ABCDE"),
+            (11, "FGHIJKLMNOPQRSTUVWXYZ1234'"),
+        ]
+        already_matched = set()
+        from main import scan_multiline_block
+        multi_findings = scan_multiline_block(block_lines, "app/config.py", already_matched)
+        self.assertGreater(len(multi_findings), 0)
+        self.assertIn("OpenAI API Key", multi_findings[0].pattern_name)
+        self.assertIn("Multi-Line Split", multi_findings[0].pattern_name)
+
+    def test_base64_encoded_secret_detected(self):
+        """try_decode_base64_secret decodes a Base64 AWS key and returns the correct label."""
+        import base64
+        raw_secret = "AKIAIOSFODNN7ABCDEF12"
+        encoded = base64.b64encode(raw_secret.encode()).decode()
+        encoded = encoded + "=" * ((4 - len(encoded) % 4) % 4)
+        b64_finding = try_decode_base64_secret(encoded)
+        self.assertIsNotNone(b64_finding)
+        self.assertIn("AWS Access Key", b64_finding[0])
+        self.assertIn("Base64 Encoded", b64_finding[0])
 
 
 if __name__ == "__main__":

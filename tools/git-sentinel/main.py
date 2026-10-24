@@ -1,5 +1,6 @@
 import argparse
 import ast
+import base64
 from collections import Counter
 import json
 import math
@@ -7,6 +8,8 @@ import os
 import re
 import subprocess
 import sys
+import urllib.request
+import urllib.error
 from typing import List, Optional, Set, Tuple
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field
@@ -232,17 +235,105 @@ def mask_secret(secret: str) -> str:
     return f"{clean[:3]}...{clean[-3:]}"
 
 
+def try_decode_base64_secret(candidate: str) -> Optional[Tuple[str, str]]:
+    """Attempts to decode a Base64 literal and match known secret patterns inside it."""
+    clean = candidate.strip()
+    if len(clean) < 24 or len(clean) % 4 != 0:
+        return None
+    if not re.fullmatch(r"[A-Za-z0-9+/]+={0,2}", clean):
+        return None
+    try:
+        decoded_bytes = base64.b64decode(clean, validate=True)
+        decoded_str = decoded_bytes.decode("utf-8")
+        if not all(32 <= ord(c) <= 126 or c in "\r\n\t" for c in decoded_str):
+            return None
+        for rule_name, rule_regex in SPECIFIC_PATTERNS:
+            m = re.search(rule_regex, decoded_str)
+            if m:
+                matched_secret = m.group(1) if m.groups() else m.group(0)
+                return (f"{rule_name} (Base64 Encoded)", matched_secret)
+    except Exception:
+        return None
+    return None
+
+
+def scan_multiline_block(
+    block_lines: List[Tuple[int, str]],
+    current_file: str,
+    already_matched: Set[str],
+) -> List[LeakFinding]:
+    """Reassembles contiguous added diff lines to catch secrets split across lines."""
+    if len(block_lines) < 2:
+        return []
+    combined_raw = "\n".join(line_text for _, line_text in block_lines)
+    # Strategy 1: Collapse adjacent quote-pairs split across lines (Python implicit concat, +, \)
+    reconstructed = re.sub(
+        r"""(["'])\s*(?:\+\s*)?(?:\\\s*)?\r?\n\s*\1""",
+        "",
+        combined_raw,
+    )
+    # Strategy 2: Also join plain bare line continuations (backslash at end of line)
+    reconstructed = re.sub(r"\\\s*\n\s*", "", reconstructed)
+    # Strategy 3: Concatenate ALL added line content stripped of leading/trailing quotes
+    #             to catch fragments that share no quote boundary at all
+    raw_concat = "".join(
+        line_text.strip().strip("'\"") for _, line_text in block_lines
+    )
+
+    multi_findings: List[LeakFinding] = []
+    start_line = block_lines[0][0]
+
+    for scan_target in (reconstructed, raw_concat):
+        for rule_name, rule_regex in SPECIFIC_PATTERNS:
+            for m in re.finditer(rule_regex, scan_target):
+                matched_str = m.group(1) if m.groups() else m.group(0)
+                if any(matched_str in s or s in matched_str for s in already_matched):
+                    continue
+                ent = calculate_shannon_entropy(matched_str)
+                test_ctx = is_test_file_or_mock(current_file, combined_raw)
+                env_var = infer_env_var_name(combined_raw, rule_name)
+                multi_findings.append(
+                    LeakFinding(
+                        filename=current_file,
+                        line_no=start_line,
+                        snippet=block_lines[0][1].strip() + " ... [multi-line]",
+                        raw_secret=matched_str,
+                        pattern_name=f"{rule_name} (Multi-Line Split)",
+                        entropy=ent,
+                        is_test_context=test_ctx,
+                        suggested_env_var=env_var,
+                    )
+                )
+                already_matched.add(matched_str)
+    return multi_findings
+
+
 def scan_diff_text(diff_text: str, entropy_threshold: float = 3.8) -> List[LeakFinding]:
     """Parses unified diff output and flags additions matching regex or entropy thresholds."""
     findings = []
     current_file = "unknown"
     line_number = 0
+    # Accumulates contiguous added lines per hunk for multi-line analysis
+    current_hunk_added: List[Tuple[int, str]] = []
+    all_matched_secrets: Set[str] = set()
+
+    def flush_multiline_block():
+        """Run multi-line reassembly on the accumulated hunk buffer."""
+        nonlocal current_hunk_added
+        if len(current_hunk_added) >= 2:
+            ml_findings = scan_multiline_block(current_hunk_added, current_file, all_matched_secrets)
+            findings.extend(ml_findings)
+            for f in ml_findings:
+                all_matched_secrets.add(f.raw_secret)
+        current_hunk_added = []
 
     for raw_line in diff_text.splitlines():
         if raw_line.startswith("+++ b/"):
+            flush_multiline_block()
             current_file = raw_line[6:].strip()
             continue
         if raw_line.startswith("@@"):
+            flush_multiline_block()
             match = re.search(r"\+(\d+)", raw_line)
             if match:
                 line_number = int(match.group(1)) - 1
@@ -279,6 +370,7 @@ def scan_diff_text(diff_text: str, entropy_threshold: float = 3.8) -> List[LeakF
                         )
                     )
                     matched_secrets.add(matched_str)
+                    all_matched_secrets.add(matched_str)
 
             # 2. Generic assignment fallback (only if not already matched)
             for rule_name, rule_regex in GENERIC_PATTERNS:
@@ -302,6 +394,7 @@ def scan_diff_text(diff_text: str, entropy_threshold: float = 3.8) -> List[LeakF
                         )
                     )
                     matched_secrets.add(matched_str)
+                    all_matched_secrets.add(matched_str)
 
             # 3. Shannon entropy detection for unclassified string literals
             if not matched_secrets:
@@ -327,8 +420,40 @@ def scan_diff_text(diff_text: str, entropy_threshold: float = 3.8) -> List[LeakF
                             )
                         )
                         matched_secrets.add(candidate)
+                        all_matched_secrets.add(candidate)
+                    else:
+                        # 4. Base64 de-obfuscation on unmatched string literals
+                        b64_result = try_decode_base64_secret(candidate)
+                        if b64_result:
+                            b64_pattern_name, b64_secret = b64_result
+                            if not any(b64_secret in s or s in b64_secret for s in all_matched_secrets):
+                                b64_entropy = calculate_shannon_entropy(b64_secret)
+                                test_ctx = is_test_file_or_mock(current_file, trimmed)
+                                env_var = infer_env_var_name(trimmed, b64_pattern_name)
+                                findings.append(
+                                    LeakFinding(
+                                        filename=current_file,
+                                        line_no=line_number,
+                                        snippet=trimmed,
+                                        raw_secret=b64_secret,
+                                        pattern_name=b64_pattern_name,
+                                        entropy=b64_entropy,
+                                        is_test_context=test_ctx,
+                                        suggested_env_var=env_var,
+                                    )
+                                )
+                                all_matched_secrets.add(b64_secret)
+
+            # Accumulate for multi-line analysis
+            current_hunk_added.append((line_number, added_content))
+
         elif not raw_line.startswith("-"):
+            # Context line breaks the contiguous added block
+            flush_multiline_block()
             line_number += 1
+
+    # Final flush for last hunk
+    flush_multiline_block()
 
     return findings
 
@@ -355,6 +480,65 @@ def get_staged_diff() -> str:
     except Exception as e:
         console.print(f"[bold red]Error running git diff:[/bold red] {e}")
         return ""
+
+
+def batch_analyze_with_ollama(findings: List[LeakFinding]) -> bool:
+    """
+    Tier-2 Intelligence: Attempts local offline LLM triage via Ollama if reachable.
+    Uses only Python stdlib (urllib + json). Times out in 1.5s if Ollama is not running
+    so it never blocks commits on offline machines.
+    """
+    host = os.getenv("OLLAMA_HOST", "http://localhost:11434").rstrip("/")
+    model = os.getenv("OLLAMA_MODEL", "llama3.2")
+    try:
+        # Fast 1.5s ping to check if local Ollama daemon is running
+        req = urllib.request.Request(f"{host}/api/tags", method="GET")
+        with urllib.request.urlopen(req, timeout=1.5) as resp:
+            if resp.status != 200:
+                return False
+
+        prompt_items = [
+            {
+                "finding_index": idx,
+                "file": f.filename,
+                "pattern": f.pattern_name,
+                "entropy": round(f.entropy, 2),
+                "heuristic_test_flag": f.is_test_context,
+                "snippet": f.snippet,
+            }
+            for idx, f in enumerate(findings)
+        ]
+        prompt = (
+            "Analyze these potential git secret leaks. Return ONLY valid JSON with key 'analyses' "
+            "containing a list of objects with keys: finding_index (int), token_type (str), "
+            "is_false_positive (bool), severity (CRITICAL|HIGH|MEDIUM|LOW|SAFE), "
+            "exposure_context (str), remediation_steps (str), suggested_env_var (str).\n"
+            f"Input: {json.dumps(prompt_items)}"
+        )
+        payload = json.dumps({
+            "model": model,
+            "prompt": prompt,
+            "format": "json",
+            "stream": False,
+        }).encode("utf-8")
+
+        gen_req = urllib.request.Request(
+            f"{host}/api/generate",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(gen_req, timeout=15.0) as gen_resp:
+            body = json.loads(gen_resp.read().decode("utf-8"))
+            parsed = BatchLeakAnalysis.model_validate_json(body.get("response", "{}"))
+            for item in parsed.analyses:
+                if 0 <= item.finding_index < len(findings):
+                    findings[item.finding_index].analysis = item
+                    if item.suggested_env_var:
+                        findings[item.finding_index].suggested_env_var = item.suggested_env_var
+            return True
+    except Exception:
+        return False
 
 
 def batch_analyze_with_gemini(findings: List[LeakFinding], api_key: str) -> None:
@@ -742,18 +926,33 @@ def main():
     if not args.json:
         console.print(f"[bold yellow]! Detected {len(findings)} potential credential token(s) or high-entropy string(s).[/bold yellow]")
 
-    # AI Triage & Batched Analysis
+    # 3-Tier AI Triage & Batched Analysis
+    # Tier 1: Google Gemini (Cloud AI)
+    # Tier 2: Local Ollama (Offline LLM)
+    # Tier 3: Shannon Entropy + AST Heuristics (Zero-dependency)
     api_key = os.getenv("GEMINI_API_KEY")
     if api_key and api_key != "your_gemini_api_key_here":
         if not args.json:
-            with console.status("[bold green]Running batched semantic triage using Google Gemini..."):
+            with console.status("[bold green]Tier-1: Running batched semantic triage using Google Gemini..."):
                 batch_analyze_with_gemini(findings, api_key)
         else:
             batch_analyze_with_gemini(findings, api_key)
     else:
+        # Try Tier-2: local Ollama
+        ollama_used = False
         if not args.json:
-            console.print("[dim]GEMINI_API_KEY unset. Running local heuristics (Shannon entropy + AST test detection).[/dim]")
-        apply_local_heuristic_analysis(findings)
+            with console.status("[bold yellow]Tier-1 (Gemini) unavailable. Attempting Tier-2: Local Ollama..."):
+                ollama_used = batch_analyze_with_ollama(findings)
+        else:
+            ollama_used = batch_analyze_with_ollama(findings)
+
+        if ollama_used:
+            if not args.json:
+                console.print("[dim]Tier-2: Ollama local LLM analysis complete.[/dim]")
+        else:
+            if not args.json:
+                console.print("[dim]Tier-3: Running local heuristics (Shannon entropy + AST test detection).[/dim]")
+            apply_local_heuristic_analysis(findings)
 
     # Autonomous Remediation
     actionable_leaks = [f for f in findings if f.analysis and not f.analysis.is_false_positive and f.analysis.severity in ("CRITICAL", "HIGH")]

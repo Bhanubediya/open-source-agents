@@ -12,20 +12,20 @@
 
 Traditional secret scanners (like basic regex scripts) generate excessive false alarms on test fixtures, miss custom high-entropy credentials, and force developers to manually fix their code. 
 
-GitSentinel introduces a **Tri-Layer Autonomous Architecture**:
+GitSentinel introduces a **Quad-Layer Autonomous Architecture**:
 
 1. **High-Confidence Regex + Shannon Entropy:**
    - Detects AWS, GitHub, OpenAI (`sk-proj-`), Anthropic, Google Gemini, Slack, Stripe, and Private RSA/SSH keys.
    - Calculates mathematical **Shannon Entropy ($H \ge 3.8$)** to catch unlabelled proprietary tokens and hex/base64 hashes without needing a known prefix.
-2. **Context & AST-Aware Mock Triage:**
+2. **Multi-Line Split & Base64 De-obfuscation:**
+   - Reassembles secrets fragmented across adjacent diff lines (Python implicit string concat, `+`, and `\` continuations).
+   - Decodes inline Base64 string literals and scans the payload against all provider patterns.
+3. **Context & AST-Aware Mock Triage:**
    - Understands test fixtures, mock suites, and dummy placeholders (e.g. `test_*.py`, `conftest.py`, `dummy_key`), avoiding disruptive false-positive blocks.
-3. **Batched Gemini 2.5/1.5 Flash Semantic Agent:**
-   - Single-roundtrip batched semantic analysis with structured JSON output, inferring idiomatic environment variable names and key rotation advice.
-4. **Autonomous Self-Healing (`--fix`):**
-   - Automatically moves leaked secrets into `.env`.
-   - Ensures `.env` is in `.gitignore`.
-   - Rewrites file references to `os.environ.get("<SUGGESTED_VAR>")`.
-   - Re-stages the sanitized changes in Git.
+4. **3-Tier Intelligence Hierarchy:**
+   - **Tier 1 — Gemini Cloud AI:** Batched structured JSON semantic triage via `gemini-2.5-flash` / `gemini-1.5-flash`.
+   - **Tier 2 — Local Ollama LLM:** Stdlib-only (`urllib` + `json`) offline fallback, pings Ollama in 1.5 s — never blocks commits if Ollama is not running.
+   - **Tier 3 — Shannon Entropy + AST Heuristics:** Zero-dependency deterministic analysis always available.
 
 ---
 
