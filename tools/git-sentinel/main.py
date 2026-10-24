@@ -396,12 +396,44 @@ def scan_diff_text(diff_text: str, entropy_threshold: float = 3.8) -> List[LeakF
                     matched_secrets.add(matched_str)
                     all_matched_secrets.add(matched_str)
 
-            # 3. Shannon entropy detection for unclassified string literals
+            # 3. Base64 de-obfuscation on unmatched string literals (runs BEFORE Shannon
+            #    entropy so high-entropy encoded keys get the specific label, e.g.
+            #    "OpenAI API Key (Base64 Encoded)" instead of "High Entropy Secret")
             if not matched_secrets:
                 literal_matches = re.finditer(r'["\']([A-Za-z0-9_\-+/=]{20,})["\']', added_content)
                 for lit in literal_matches:
                     candidate = lit.group(1)
-                    if any(candidate in s or s in candidate for s in matched_secrets):
+                    if any(candidate in s or s in candidate for s in all_matched_secrets):
+                        continue
+                    b64_result = try_decode_base64_secret(candidate)
+                    if b64_result:
+                        b64_pattern_name, b64_secret = b64_result
+                        if not any(b64_secret in s or s in b64_secret for s in all_matched_secrets):
+                            b64_entropy = calculate_shannon_entropy(b64_secret)
+                            test_ctx = is_test_file_or_mock(current_file, trimmed)
+                            env_var = infer_env_var_name(trimmed, b64_pattern_name)
+                            findings.append(
+                                LeakFinding(
+                                    filename=current_file,
+                                    line_no=line_number,
+                                    snippet=trimmed,
+                                    raw_secret=b64_secret,
+                                    pattern_name=b64_pattern_name,
+                                    entropy=b64_entropy,
+                                    is_test_context=test_ctx,
+                                    suggested_env_var=env_var,
+                                )
+                            )
+                            matched_secrets.add(candidate)
+                            all_matched_secrets.add(b64_secret)
+
+            # 4. Shannon entropy fallback for remaining unclassified string literals
+            #    (after Base64 check, so encoded keys already have specific labels)
+            if not matched_secrets:
+                literal_matches = re.finditer(r'["\']([A-Za-z0-9_\-+/=]{20,})["\']', added_content)
+                for lit in literal_matches:
+                    candidate = lit.group(1)
+                    if any(candidate in s or s in candidate for s in all_matched_secrets):
                         continue
                     ent = calculate_shannon_entropy(candidate)
                     if ent >= entropy_threshold:
@@ -421,28 +453,6 @@ def scan_diff_text(diff_text: str, entropy_threshold: float = 3.8) -> List[LeakF
                         )
                         matched_secrets.add(candidate)
                         all_matched_secrets.add(candidate)
-                    else:
-                        # 4. Base64 de-obfuscation on unmatched string literals
-                        b64_result = try_decode_base64_secret(candidate)
-                        if b64_result:
-                            b64_pattern_name, b64_secret = b64_result
-                            if not any(b64_secret in s or s in b64_secret for s in all_matched_secrets):
-                                b64_entropy = calculate_shannon_entropy(b64_secret)
-                                test_ctx = is_test_file_or_mock(current_file, trimmed)
-                                env_var = infer_env_var_name(trimmed, b64_pattern_name)
-                                findings.append(
-                                    LeakFinding(
-                                        filename=current_file,
-                                        line_no=line_number,
-                                        snippet=trimmed,
-                                        raw_secret=b64_secret,
-                                        pattern_name=b64_pattern_name,
-                                        entropy=b64_entropy,
-                                        is_test_context=test_ctx,
-                                        suggested_env_var=env_var,
-                                    )
-                                )
-                                all_matched_secrets.add(b64_secret)
 
             # Accumulate for multi-line analysis
             current_hunk_added.append((line_number, added_content))
